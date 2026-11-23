@@ -45,10 +45,10 @@ import tulis  # noqa: E402,F401
 
 from github import gh_api  # noqa: E402,F401
 try:
-    from github import cdp_gate  # noqa: E402,F401
-    HAS_CDP = True
+    from github import playwright_gate  # noqa: E402,F401
+    HAS_PG = True
 except Exception:
-    HAS_CDP = False
+    HAS_PG = False
 
 try:
     from curl_cffi import requests as creq
@@ -70,12 +70,12 @@ _ARKOSE_PUBKEY_RE = re.compile(
 
 
 def _cek_cf_solver():
-    """Cek apakah cf-solver FastAPI siap (GET /types)."""
+    """Cek apakah cf-solver FastAPI siap (GET /health)."""
     if not HAS_CURL:
         return False
     try:
-        r = creq.get(f"{CF_SOLVER_URL}/types", timeout=5, impersonate="chrome157")
-        return r.status_code == 200 and "arkose" in (r.text or "").lower()
+        r = creq.get(f"{CF_SOLVER_URL}/health", timeout=5, impersonate="chrome157")
+        return r.status_code == 200
     except Exception:
         return False
 
@@ -101,8 +101,9 @@ def _solve_arkose(public_key, page_url, proxy=None, timeout_s=120):
     try:
         pr = None
         if proxy:
-            pr = {"https": f"http://{proxy}" if "://" not in proxy else proxy,
-                  "http": f"http://{proxy}" if "://" not in proxy else proxy}
+            pr = gh_api.ke_url(proxy)
+            if pr:
+                pr = {"https": pr, "http": pr}
         r = creq.post(
             f"{CF_SOLVER_URL}/solve",
             json={
@@ -220,6 +221,30 @@ def _ambil_kode_launch(mail, pw, t0, budget=240):
         return None, f"otp-gagal:{type(e).__name__}:{str(e)[:60]}"
 
 
+def _proxy_untuk_playwright(px):
+    """http://user:pass@host:port -> host:port:user:pass untuk playwright_gate."""
+    if not px:
+        return None
+    if px.startswith("http://"):
+        px = px[7:]
+    if "@" in px:
+        auth, hostport = px.split("@", 1)
+        parts = auth.split(":", 1)
+        user = parts[0] if len(parts) > 0 else ""
+        pw = parts[1] if len(parts) > 1 else ""
+        return f"{hostport}:{user}:{pw}"
+    return px
+
+
+def _proxy_untuk_cf_solver(px):
+    """http://user:pass@host:port -> user:pass@host:port untuk cf-solver."""
+    if not px:
+        return None
+    if px.startswith("http://"):
+        return px[7:]
+    return px
+
+
 def _simpan_hasil(mail, pw, user, totp_secret, recovery_codes):
     REGISTERED_F.parent.mkdir(parents=True, exist_ok=True)
     baris = f"{mail}|{pw}|{user}|{totp_secret or ''}|{recovery_codes or ''}\n"
@@ -260,15 +285,13 @@ def daftar_akun_github(proxy=None, headless=True, negara="ID",
     if delay_anti_suspend > 0:
         time.sleep(delay_anti_suspend * 60 * random.uniform(0.5, 1.5))
 
-    # --- 2. Gate browser (DataDome + FunCaptcha) ---
+    # --- 2. Gate browser (DataDome + FunCaptcha) via Playwright ---
     sesi = None
     r = None
     tok = None
-    if HAS_CDP:
+    if HAS_PG:
         try:
-            px = gh_api._sederhana(proxy) if proxy else gh_api.ke_url(
-                gh_api.proksi_pertama())
-            b = cdp_gate.pinjam_browser(proxy=px or None, headless=headless)
+            b = playwright_gate.pinjam_browser(proxy=proxy, headless=headless)
             ctx = b.new_context()
             page = ctx.new_page()
             page.goto(SIGNUP_URL, wait_until="domcontentloaded", timeout=30000)
@@ -296,7 +319,7 @@ def daftar_akun_github(proxy=None, headless=True, negara="ID",
             return log
     else:
         # fallback: HTTP-only via gh_api kalibrasi
-        pool = [gh_api._sederhana(proxy)] if proxy else None
+        pool = [gh_api._sederhana(proxy)] if proxy else []
         sesi, r, _ = gh_api.kalibrasi_sesi(pool, maks=5, email=email)
         if not sesi:
             log["alasan"] = "gate-http-gagal"
@@ -328,10 +351,9 @@ def daftar_akun_github(proxy=None, headless=True, negara="ID",
     if not octo_token and _cek_cf_solver():
         arkose_pubkey = _ecak_public_key(html)
         if arkose_pubkey:
-            px = gh_api._sederhana(proxy) if proxy else gh_api.ke_url(
-                gh_api.proksi_pertama())
+            px_cf = _proxy_untuk_cf_solver(proxy)
             octo_token, err = _solve_arkose(
-                arkose_pubkey, referer, proxy=px, timeout_s=120)
+                arkose_pubkey, referer, proxy=px_cf, timeout_s=120)
             if err:
                 log["catatan_captcha"] = err
         else:
