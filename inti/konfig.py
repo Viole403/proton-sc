@@ -20,7 +20,7 @@ VENDOR = AKAR / "vendor"
 ARSIP = AKAR / "arsip"
 
 DATA = AKAR / "data"
-RESULTS = AKAR / "results"
+RESULTS = AKAR / "proton" / "results"
 
 # alias kompatibel (dipakai modul yang sudah diedit; = folder kode domain)
 PROTON_DIR = PROTON
