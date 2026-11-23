@@ -1,0 +1,23 @@
+# Core
+playwright>=1.53.0
+patchright>=1.61.0
+requests>=2.34.0
+curl_cffi>=0.13.0
+
+# Crypto / auth
+bcrypt>=5.0.0
+
+# Image / CV
+numpy>=2.5.0
+Pillow>=12.3.0
+
+# Proxy / MITM (optional, for router cache)
+mitmproxy>=12.0.0
+
+# Selenium (optional, for some flows)
+selenium>=4.51.0
+seleniumbase>=4.56.0
+
+# CLI helpers
+playwright-captcha>=0.1.0
+playwright-stealth>=2.0.0

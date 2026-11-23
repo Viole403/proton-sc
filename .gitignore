@@ -1,0 +1,17 @@
+.env
+venv/
+__pycache__/
+*.pyc
+*.log
+cache-stats-*.json
+proton/profil/
+proton/logs/
+browser-state/
+proton/results/
+proton/data/
+data/
+results/
+cache/
+shots/
+analysis/
+proton-sc/
