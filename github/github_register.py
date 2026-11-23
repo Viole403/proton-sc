@@ -4,10 +4,11 @@
 Alur (berdasarkan penelitian github.com/signup + ptraced/GithubPy):
 
   1. Ambil email Proton dari results/registered.txt (belum dipakai untuk GitHub)
-  2. Gate browser (cdp_gate) → atasi DataDome interstitial → /signup
+  2. Gate browser (playwright_gate) → atasi DataDome interstitial → /signup
   3. Panen token form (authenticity_token, timestamp, timestamp_secret, honeypot)
   4. Validasi email/password/username (C5-C8 lewat gh_api)
-  5. CAPTCHA FunCaptcha (Arkose Labs) — solved via cf-solver HTTP API
+  5. CAPTCHA FunCaptcha (Arkose Labs) — solved via vendored
+     vendor/captcha_solver/arkose/solve.py (ONNX prediction)
   6. POST /signup → 302 ke halaman verifikasi email
   7. Ambil kode launch 8-digit dari inbox Proton (proton_api.baca_otp)
   8. POST /account_verifications (launch_code[] x8) → akun aktif
@@ -16,7 +17,7 @@ Alur (berdasarkan penelitian github.com/signup + ptraced/GithubPy):
 REQUIRED ENV:
   * data/proxies.txt — proxy residential per akun (wajib, DataDome ketat)
   * GH_PROXY atau BRUTALISM_PROXY_FILE — override proxy GitHub
-  * CF_SOLVER_URL — URL cf-solver FastAPI (default http://localhost:8877)
+  * vendor/captcha_solver/arkose/models/*.onnx — Arkose ONNX models (~1.4GB)
   * Proton account sudah terdaftar di results/registered.txt
 
 OUTPUT: results/github_registered.txt (email|pass|username|totp_secret|recovery_codes)
@@ -51,15 +52,10 @@ except Exception:
     HAS_PG = False
 
 try:
-    from curl_cffi import requests as creq
-    HAS_CURL = True
+    from vendor.captcha_solver.arkose.solve import solve_arkose  # noqa: E402,F401
+    HAS_ARKOSE = True
 except Exception:
-    HAS_CURL = False
-
-GITHUB = "https://github.com"
-SIGNUP_URL = f"{GITHUB}/signup"
-REGISTERED_F = konfig.RESULTS / "github_registered.txt"
-CF_SOLVER_URL = os.environ.get("CF_SOLVER_URL", "http://localhost:8877")
+    HAS_ARKOSE = False
 
 _ARKOSE_PUBKEY_RE = re.compile(
     r'data-publickey="([^"]+)"|public.?key.?[:=]\s*["\']([^"\']+)["\']|'
@@ -69,15 +65,12 @@ _ARKOSE_PUBKEY_RE = re.compile(
 )
 
 
-def _cek_cf_solver():
-    """Cek apakah cf-solver FastAPI siap (GET /health)."""
-    if not HAS_CURL:
+def _cek_arkose_solver():
+    """Cek apakah vendored Arkose solver siap (ONNX models tersedia)."""
+    if not HAS_ARKOSE:
         return False
-    try:
-        r = creq.get(f"{CF_SOLVER_URL}/health", timeout=5, impersonate="chrome157")
-        return r.status_code == 200
-    except Exception:
-        return False
+    models_dir = Path(__file__).parent.parent / "vendor" / "captcha_solver" / "arkose" / "models"
+    return models_dir.is_dir() and any(models_dir.glob("*.onnx"))
 
 
 def _ecak_public_key(html):
@@ -91,42 +84,26 @@ def _ecak_public_key(html):
 
 
 def _solve_arkose(public_key, page_url, proxy=None, timeout_s=120):
-    """Panggil cf-solver POST /solve dengan type=arkose.
+    """Panggil vendored Arkose solver (vendor/captcha_solver/arkose/solve.py).
 
     Return token string atau None bila gagal."""
-    if not HAS_CURL:
-        return None, "curl-cffi-tidak-tersedia"
+    if not HAS_ARKOSE:
+        return None, "arkose-solver-tidak-tersedia"
     if not public_key:
         return None, "public-key-kosong"
     try:
-        pr = None
-        if proxy:
-            pr = gh_api.ke_url(proxy)
-            if pr:
-                pr = {"https": pr, "http": pr}
-        r = creq.post(
-            f"{CF_SOLVER_URL}/solve",
-            json={
-                "type": "arkose",
-                "public_key": public_key,
-                "url": page_url,
-                "proxy": proxy,
-                "game_type": "4",
-                "timeout_s": timeout_s,
-            },
-            headers={"Content-Type": "application/json"},
-            timeout=timeout_s + 10,
-            impersonate="chrome157",
-            proxies=pr,
+        pr = _proxy_untuk_playwright(proxy) if proxy else None
+        result = solve_arkose(
+            public_key=public_key,
+            page_url=page_url,
+            proxy=pr,
+            timeout_s=timeout_s,
         )
-        if r.status_code != 200:
-            return None, f"cf-solver-http-{r.status_code}"
-        data = r.json() or {}
-        if not data.get("solved"):
-            return None, f"cf-solver-gagal:{data.get('error','tidak-diketahui')}"
-        return data.get("token"), None
+        if not result.get("solved"):
+            return None, f"arkose-gagal:{result.get('error','tidak-diketahui')}"
+        return result.get("token"), None
     except Exception as e:
-        return None, f"cf-solver-exc:{type(e).__name__}:{str(e)[:60]}"
+        return None, f"arkose-exc:{type(e).__name__}:{str(e)[:60]}"
 
 
 def _username_dari_email(mail):
@@ -346,20 +323,20 @@ def daftar_akun_github(proxy=None, headless=True, negara="ID",
         log["status"] = "validasi-gagal"
         return log
 
-    # --- 4. CAPTCHA FunCaptcha (Arkose Labs) via cf-solver ---
+    # --- 4. CAPTCHA FunCaptcha (Arkose Labs) via vendored solver ---
     octo_token = os.environ.get("OCTOCAPTCHA_TOKEN", "")
-    if not octo_token and _cek_cf_solver():
+    if not octo_token and _cek_arkose_solver():
         arkose_pubkey = _ecak_public_key(html)
         if arkose_pubkey:
-            px_cf = _proxy_untuk_cf_solver(proxy)
+            px = _proxy_untuk_playwright(proxy) if proxy else None
             octo_token, err = _solve_arkose(
-                arkose_pubkey, referer, proxy=px_cf, timeout_s=120)
+                arkose_pubkey, referer, proxy=px, timeout_s=120)
             if err:
                 log["catatan_captcha"] = err
         else:
             log["catatan_captcha"] = "arkose-public-key-tidak-ditemukan"
     elif not octo_token:
-        log["catatan_captcha"] = "cf-solver-tidak-tersedia"
+        log["catatan_captcha"] = "arkose-solver-tidak-tersedia"
 
     # --- 5. POST /signup ---
     try:
