@@ -226,12 +226,15 @@ def main():
     ap.add_argument("--mode", choices=["oneshot", "batch"], default="oneshot")
     ap.add_argument("--per-batch", type=int, default=0)
     ap.add_argument("--batch-pause", type=float, default=0)
+    ap.add_argument("--anti-suspend-delay", type=float, default=0,
+                    help="jeda menit antar akun (anti-suspend bulk signup)")
     args = ap.parse_args()
 
     if args.auto == "run":
         orc = core.Orchestrator(workers=args.workers, accounts=args.accounts, mode=args.mode,
                                 per_batch=args.per_batch or args.accounts,
-                                batch_pause_min=args.batch_pause)
+                                batch_pause_min=args.batch_pause,
+                                per_account_delay_min=args.anti_suspend_delay)
         try:
             orc.run()
         finally:

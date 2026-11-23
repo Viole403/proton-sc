@@ -458,12 +458,17 @@ def run_attempt(slot, port, retry_ke=1, no=0):
 class Orchestrator:
     """Worker paralel + batch + retry + stop darurat."""
 
-    def __init__(self, workers=1, accounts=1, mode="oneshot", per_batch=0, batch_pause_min=0):
+    def __init__(self, workers=1, accounts=1, mode="oneshot", per_batch=0, batch_pause_min=0,
+                 per_account_delay_min=0):
         self.workers = max(1, int(workers))
         self.accounts = max(1, int(accounts))
         self.mode = mode
         self.per_batch = int(per_batch) or self.accounts
         self.batch_pause = float(batch_pause_min)
+        # [anti-suspend 2026-11-23] jeda acak antar akun dalam satu batch —
+        # mencegah pola bulk signup terlalu padat dari satu IP/exit.
+        self.per_account_delay = float(per_account_delay_min) or float(
+            os.environ.get("ANTI_SUSPEND_DELAY_MIN", "0"))
         self.lock = threading.Lock()
         self.stop_flag = False
         self.consec_fail = 0
@@ -526,6 +531,12 @@ class Orchestrator:
                     "timeout": False, "hv_methods": None, "no_method": False,
                     "domain_blocked": False, "username": None, "alias": None, "fp_seed": None,
                     "tail": ["(dilewati — stop trigger aktif)"]}
+        # [anti-suspend 2026-11-23] jeda acak antar akun — hindari pola bulk signup
+        # terlalu padat yang memicu clustering ML Proton.
+        if self.per_account_delay > 0 and no > 0:
+            t_jeda = self.per_account_delay * 60 * random.uniform(0.5, 1.5)
+            self._log(f"jeda anti-suspend: {t_jeda:.0f} detik sebelum slot#{no}")
+            time.sleep(t_jeda)
         port = self._ensure_router(wid)
         # upstream proxy diarahkan per-attempt lewat file upstream-<port>.json
         # [mode DIRECT] PROTON_DIRECT=1 -> upstream kosong (router_cache.server_connect

@@ -565,6 +565,8 @@ def _aksi_onboarding(page, layar, note, username, log):
             # SUDAH terisi nama akun UTUH oleh app (DisplayName=user asli) —
             # JANGAN dikosongkan/diisi potongan acak (dulu username[:3..8] +
             # fill("") merusak isi awal = beda dari perilaku manusia).
+            # [anti-suspend 2026-11-23] isi nama manusia realistis (depan+belakang)
+            # bukan username 'flav5942ianus' yang terdeteksi pola bot.
             isi = ""
             if inp.count() and inp.is_visible():
                 try:
@@ -572,13 +574,17 @@ def _aksi_onboarding(page, layar, note, username, log):
                 except Exception:
                     isi = ""
             if not isi:
-                human_type(page, inp, username)
+                nama_tampil = _nama_tampilkan()
+                log["display_name"] = nama_tampil
+                human_type(page, inp, nama_tampil)
                 time.sleep(random.uniform(0.5, 1.5))
+            else:
+                log["display_name"] = isi
             n_klik = int(log.get("display_name_klik", 0)) + 1
             log["display_name_klik"] = n_klik
             shot(page, f"display-name-klik-{n_klik}")
             btn.click(timeout=4000)
-            note(f"display name: Continue diklik ({n_klik}/3) isi='{isi or username}'")
+            note(f"display name: Continue diklik ({n_klik}/3) isi='{isi or log.get('display_name','')}'")
             time.sleep(random.uniform(3.0, 5.0))
         except Exception as e:
             note(f"display name aksi gagal: {type(e).__name__}: {str(e)[:60]}")
@@ -1241,6 +1247,25 @@ def wait_otp(alias, meta, t0, budget=240):
 _NAMA_AWAL = ["mar", "jul", "aug", "luc", "fel", "cor", "vin", "cla", "sei", "tar",
               "gal", "cam", "oct", "pomp", "cass", "flav", "sext", "tib", "gai", "lucr"]
 _NAMA_AKHIR = ["ius", "ia", "us", "a", "um", "inus", "ella", "ianus", "iana", "io", "or", "on"]
+
+# Nama depan & belakang realistis untuk display name Proton (anti-suspend:
+# nama acak 'flav5942ianus' terdeteksi pola bot; nama manusia lebih natural)
+_NAMA_DEPAN = ["Adi", "Budi", "Citra", "Dedi", "Eka", "Fajar", "Gita", "Hana",
+               "Indah", "Joko", "Kirana", "Luki", "Maya", "Nina", "Oki", "Putri",
+               "Rama", "Sari", "Tono", "Uma", "Vina", "Wawan", "Yoga", "Zara",
+               "Arif", "Bella", "Cahy", "Dewi", "Fika", "Gede", "Hari", "Ika"]
+_NAMA_BELAKANG = ["Pratama", "Saputra", "Wijaya", "Kusuma", "Putra", "Lestari",
+                  "Astuti", "Hidayat", "Ningrum", "Setiawan", "Rahayu", "Mahendra",
+                  "Suharto", "Permana", "Susanti", "Manurung", "Sapto", "Kurnia",
+                  "Hidayanto", "Wijaya", "Firmansyah", "Rahardjo", "Muliawan",
+                  "Nugroho", "Hidayat", "Suryono", "Darajat", "Efendi", "Gunawan"]
+
+
+def _nama_tampilkan():
+    """Display name realistis (depan + belakang, spasi di antaranya) — anti-suspend:
+    Proton ML clustering mendeteksi pola nama acak 'flav5942ianus' sebagai bot.
+    Nama manusia depan+belakang lebih natural dan sulit diklasifikasikan bulk."""
+    return f"{secrets.choice(_NAMA_DEPAN)} {secrets.choice(_NAMA_BELAKANG)}"
 
 
 _PID_UNIK = f"{os.getpid() % 100:02d}"   # [anti-tabrak 2026-10-16] akhiran unik

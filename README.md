@@ -162,6 +162,35 @@ python proton/tui.py --auto clean
 python proton/tui.py --auto prewarm
 ```
 
+### Anti-suspend mitigasi (penting)
+
+Proton menggunakan ML clustering untuk mendeteksi bulk/scripted signup. Akun
+yang terdeteksi akan **ditangguhkan (suspended)**. Untuk mengurangi risiko:
+
+| Opsi | Keterangan | Disarankan |
+|------|-----------|------------|
+| `--anti-suspend-delay N` | Jeda N menit antar akun dalam satu batch | 5-15 menit |
+| `--batch-pause N` | Jeda N menit antar batch | 30-60 menit |
+| Satu proxy residential per akun | Jangan reuse proxy untuk banyak akun | Wajib |
+| `ANTI_SUSPEND_DELAY_MIN=N` | Env var alternatif ke `--anti-suspend-delay` | 5-15 |
+| `NAIKKAN_SESI=1` | Upgrade scope sesi (berisiko, bisa buang akun) | 0 (mati) |
+| Proxy kualitas tinggi | Hindari proxy publik/datacenter yang sudah kena flag | Wajib |
+
+Contoh aman (1 akun, jeda 10 menit kalau banyak):
+
+```bash
+# 1 akun, tanpa jeda (test)
+python proton/tui.py --auto run --accounts 1 --workers 1
+
+# 3 akun, jeda 10 menit antar akun, batch 1 per batch
+python proton/tui.py --auto run --accounts 3 --workers 1 --mode batch \
+  --per-batch 1 --batch-pause 30 --anti-suspend-delay 10
+```
+
+**Peringatan:** Pembuatan akun massal melanggar Ketentuan Layanan Proton.
+Akun yang kena suspend dapat di-appeal via
+https://proton.me/support/appeal-abuse tapi tidak dijamin dibuka.
+
 ### Jalur signup inti
 
 `proton/core.py` (orkestrasi) → `full_fidelity2.py` (persona + mutasi blob)
