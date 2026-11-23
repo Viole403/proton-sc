@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
-"""Menu utama PROTON SIGNUP TOOLKIT v3 — cukup jalankan:  ./venv/bin/python tui.py
+"""Menu utama PROTON SIGNUP TOOLKIT v4 — cukup jalankan:  ./venv/bin/python tui.py
 
 Menu interaktif:
-  1. run            — one-shot atau batch (akun/batch + jeda antar batch)
-  2. proxy-pool     — lihat/tambah/uji daftar proxy (data/proxies.txt)
-  3. registered     — lihat akun sukses (file results/registered.txt)
-  4. proton-checker — cek akun masih aktif (via refresh token)
-  5. settings       — API key: headmail / evilmail / smsbower (+ negara SMS)
-  6. statistik      — rata2 menit per akun + pemakaian byte proxy/langsung/cache
-  7. kebersihan     — bebaskan RAM (Chrome nyangkut), hapus sisa profil /tmp,
-                      pangkas screenshot lama (bukti penting disimpan)
-  8. prewarm-cache  — panaskan 1x asset ke cache router (hemat proxy saat batch)
-  9. keluar
+  1. run              — one-shot atau batch (akun/batch + jeda antar batch)
+  2. proxy-pool       — lihat/tambah/uji daftar proxy (data/proxies.txt)
+  3. registered       — lihat akun Proton sukses (results/registered.txt)
+  4. proton-checker   — cek akun masih aktif (via refresh token)
+  5. settings         — API key: headmail / evilmail / smsbower (+ negara SMS)
+  6. statistik        — rata2 menit per akun + pemakaian byte proxy/langsung/cache
+  7. kebersihan       — bebaskan RAM (Chrome nyangkut), hapus sisa profil /tmp,
+                        pangkas screenshot lama (bukti penting disimpan)
+  8. prewarm-cache    — panaskan 1x asset ke cache router (hemat proxy saat batch)
+  9. register-qoder   — daftar akun Qoder via akun GitHub
+  10. register-cb     — daftar akun CodeBuddy via akun GitHub
+  11. keluar
 
 Mode non-interaktif (otomasi/pengujian):
   ./venv/bin/python tui.py --auto run   --accounts 6 --workers 2 --mode oneshot
-  ./venv/bin/python tui.py --auto check                      # cek semua akun
+  ./venv/bin/python tui.py --auto check                      # cek semua akun Proton
   ./venv/bin/python tui.py --auto stats                       # ringkasan metrik
   ./venv/bin/python tui.py --auto clean                       # perawatan
   ./venv/bin/python tui.py --auto prewarm                     # panaskan cache
@@ -46,6 +48,18 @@ try:
     _runmod.pasang_patch()
 except Exception:
     pass
+
+try:
+    from cb import qoder_register  # noqa: E402,F401
+    HAS_QODER = True
+except Exception:
+    HAS_QODER = False
+
+try:
+    from cb import codebuddy_register  # noqa: E402,F401
+    HAS_CB = True
+except Exception:
+    HAS_CB = False
 
 BANNER = r"""
 ╔══════════════════════════════════════════════════╗
@@ -217,6 +231,46 @@ def menu_prewarm():
     print(core.prewarm_cache())
 
 
+def menu_register_qoder():
+    print("\n— REGISTER QODER (via GitHub) —")
+    if not HAS_QODER:
+        print("modul qoder_register tidak tersedia.")
+        return
+    email = input("email GitHub: ").strip()
+    pw = input("password GitHub: ").strip()
+    if not email or not pw:
+        print("email dan password wajib diisi.")
+        return
+    accounts = int(input("jumlah akun Qoder: ").strip() or "1")
+    delay = float(input("jeda antar akun (menit, anti-suspend): ").strip() or "5")
+    hasil = qoder_register.daftar_batch(
+        jumlah=accounts, delay_menit=delay)
+    for r in hasil:
+        print(f"  {r['email']} | {r['status']} | {r['alasan']}")
+    if core.REGISTERED_F.parent.joinpath("qoder_registered.txt").exists():
+        print(f"hasil disimpan di results/qoder_registered.txt")
+
+
+def menu_register_codebuddy():
+    print("\n— REGISTER CODEBUDDY (via GitHub) —")
+    if not HAS_CB:
+        print("modul codebuddy_register tidak tersedia.")
+        return
+    email = input("email GitHub: ").strip()
+    pw = input("password GitHub: ").strip()
+    if not email or not pw:
+        print("email dan password wajib diisi.")
+        return
+    accounts = int(input("jumlah akun CodeBuddy: ").strip() or "1")
+    delay = float(input("jeda antar akun (menit, anti-suspend): ").strip() or "5")
+    hasil = codebuddy_register.daftar_batch(
+        jumlah=accounts, delay_menit=delay)
+    for r in hasil:
+        print(f"  {r['email']} | {r['status']} | {r['alasan']}")
+    if core.REGISTERED_F.parent.joinpath("codebuddy_registered.txt").exists():
+        print(f"hasil disimpan di results/codebuddy_registered.txt")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--auto", choices=["run", "check", "checklogin", "stats", "clean", "prewarm"],
@@ -270,7 +324,9 @@ def main():
   6. statistik
   7. kebersihan
   8. prewarm-cache
-  9. keluar""")
+  9. register-qoder
+  10. register-cb
+  11. keluar""")
         pilih = input("pilih> ").strip()
         if pilih == "1":
             menu_run()
@@ -288,7 +344,11 @@ def main():
             menu_kebersihan()
         elif pilih == "8":
             menu_prewarm()
-        elif pilih in ("9", "q", "quit", "exit"):
+        elif pilih == "9":
+            menu_register_qoder()
+        elif pilih == "10":
+            menu_register_codebuddy()
+        elif pilih in ("11", "q", "quit", "exit"):
             print("sampai jumpa!")
             return
         else:
