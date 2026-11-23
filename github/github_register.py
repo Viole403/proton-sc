@@ -7,7 +7,7 @@ Alur (berdasarkan penelitian github.com/signup + ptraced/GithubPy):
   2. Gate browser (cdp_gate) → atasi DataDome interstitial → /signup
   3. Panen token form (authenticity_token, timestamp, timestamp_secret, honeypot)
   4. Validasi email/password/username (C5-C8 lewat gh_api)
-  5. CAPTCHA FunCaptcha (Arkose Labs via octocaptcha.com) — solver browser
+  5. CAPTCHA FunCaptcha (Arkose Labs) — solved via cf-solver HTTP API
   6. POST /signup → 302 ke halaman verifikasi email
   7. Ambil kode launch 8-digit dari inbox Proton (proton_api.baca_otp)
   8. POST /account_verifications (launch_code[] x8) → akun aktif
@@ -16,6 +16,7 @@ Alur (berdasarkan penelitian github.com/signup + ptraced/GithubPy):
 REQUIRED ENV:
   * data/proxies.txt — proxy residential per akun (wajib, DataDome ketat)
   * GH_PROXY atau BRUTALISM_PROXY_FILE — override proxy GitHub
+  * CF_SOLVER_URL — URL cf-solver FastAPI (default http://localhost:8877)
   * Proton account sudah terdaftar di results/registered.txt
 
 OUTPUT: results/github_registered.txt (email|pass|username|totp_secret|recovery_codes)
@@ -24,6 +25,7 @@ from __future__ import annotations
 
 import os
 import random
+import re
 import secrets
 import string
 import time
@@ -48,19 +50,82 @@ try:
 except Exception:
     HAS_CDP = False
 
+try:
+    from curl_cffi import requests as creq
+    HAS_CURL = True
+except Exception:
+    HAS_CURL = False
+
 GITHUB = "https://github.com"
 SIGNUP_URL = f"{GITHUB}/signup"
 REGISTERED_F = konfig.RESULTS / "github_registered.txt"
+CF_SOLVER_URL = os.environ.get("CF_SOLVER_URL", "http://localhost:8877")
 
-_NAMA_DEPAN = ["Adi", "Budi", "Citra", "Dedi", "Eka", "Fajar", "Gita", "Hana",
-               "Indah", "Joko", "Kirana", "Luki", "Maya", "Nina", "Oki", "Putri",
-               "Rama", "Sari", "Tono", "Uma", "Vina", "Wawan", "Yoga", "Zara",
-               "Arif", "Bella", "Cahy", "Dewi", "Fika", "Gede", "Hari", "Ika"]
-_NAMA_BELAKANG = ["Pratama", "Saputra", "Wijaya", "Kusuma", "Putra", "Lestari",
-                  "Astuti", "Hidayat", "Ningrum", "Setiawan", "Rahayu", "Mahendra",
-                  "Suharto", "Permana", "Susanti", "Manurung", "Sapto", "Kurnia",
-                  "Hidayanto", "Wijaya", "Firmansyah", "Rahardjo", "Muliawan",
-                  "Nugroho", "Hidayat", "Suryono", "Darajat", "Efendi", "Gunawan"]
+_ARKOSE_PUBKEY_RE = re.compile(
+    r'data-publickey="([^"]+)"|public.?key.?[:=]\s*["\']([^"\']+)["\']|'
+    r'arkose[_-]?key[=:]\s*["\']([^"\']+)["\']|'
+    r'funCaptcha[_-]?key[=:]\s*["\']([^"\']+)["\']',
+    re.I,
+)
+
+
+def _cek_cf_solver():
+    """Cek apakah cf-solver FastAPI siap (GET /types)."""
+    if not HAS_CURL:
+        return False
+    try:
+        r = creq.get(f"{CF_SOLVER_URL}/types", timeout=5, impersonate="chrome157")
+        return r.status_code == 200 and "arkose" in (r.text or "").lower()
+    except Exception:
+        return False
+
+
+def _ecak_public_key(html):
+    """Cari Arkose/FunCaptcha public key dari HTML signup."""
+    m = _ARKOSE_PUBKEY_RE.search(html or "")
+    if m:
+        for g in m.groups():
+            if g and len(g) > 10:
+                return g
+    return ""
+
+
+def _solve_arkose(public_key, page_url, proxy=None, timeout_s=120):
+    """Panggil cf-solver POST /solve dengan type=arkose.
+
+    Return token string atau None bila gagal."""
+    if not HAS_CURL:
+        return None, "curl-cffi-tidak-tersedia"
+    if not public_key:
+        return None, "public-key-kosong"
+    try:
+        pr = None
+        if proxy:
+            pr = {"https": f"http://{proxy}" if "://" not in proxy else proxy,
+                  "http": f"http://{proxy}" if "://" not in proxy else proxy}
+        r = creq.post(
+            f"{CF_SOLVER_URL}/solve",
+            json={
+                "type": "arkose",
+                "public_key": public_key,
+                "url": page_url,
+                "proxy": proxy,
+                "game_type": "4",
+                "timeout_s": timeout_s,
+            },
+            headers={"Content-Type": "application/json"},
+            timeout=timeout_s + 10,
+            impersonate="chrome157",
+            proxies=pr,
+        )
+        if r.status_code != 200:
+            return None, f"cf-solver-http-{r.status_code}"
+        data = r.json() or {}
+        if not data.get("solved"):
+            return None, f"cf-solver-gagal:{data.get('error','tidak-diketahui')}"
+        return data.get("token"), None
+    except Exception as e:
+        return None, f"cf-solver-exc:{type(e).__name__}:{str(e)[:60]}"
 
 
 def _username_dari_email(mail):
@@ -77,6 +142,21 @@ def _password_acak():
         if (any(c.islower() for c in pw) and any(c.isupper() for c in pw)
                 and sum(c.isdigit() for c in pw) >= 2):
             return pw
+
+
+_NAMA_DEPAN = ["Adi", "Budi", "Citra", "Dedi", "Eka", "Fajar", "Gita", "Hana",
+               "Indah", "Joko", "Kirana", "Luki", "Maya", "Nina", "Oki", "Putri",
+               "Rama", "Sari", "Tono", "Uma", "Vina", "Wawan", "Yoga", "Zara",
+               "Arif", "Bella", "Cahy", "Dewi", "Fika", "Gede", "Hari", "Ika"]
+_NAMA_BELAKANG = ["Pratama", "Saputra", "Wijaya", "Kusuma", "Putra", "Lestari",
+                  "Astuti", "Hidayat", "Ningrum", "Setiawan", "Rahayu", "Mahendra",
+                  "Suharto", "Permana", "Susanti", "Manurung", "Sapto", "Kurnia",
+                  "Hidayanto", "Wijaya", "Firmansyah", "Rahardjo", "Muliawan",
+                  "Nugroho", "Hidayat", "Suryono", "Darajat", "Efendi", "Gunawan"]
+
+
+def _nama_tampilkan():
+    return f"{secrets.choice(_NAMA_DEPAN)} {secrets.choice(_NAMA_BELAKANG)}"
 
 
 def _email_proton_tersedia():
@@ -243,12 +323,21 @@ def daftar_akun_github(proxy=None, headless=True, negara="ID",
         log["status"] = "validasi-gagal"
         return log
 
-    # --- 4. CAPTCHA octocaptcha-token ---
+    # --- 4. CAPTCHA FunCaptcha (Arkose Labs) via cf-solver ---
     octo_token = os.environ.get("OCTOCAPTCHA_TOKEN", "")
-    if not octo_token and HAS_CDP:
-        # solver akan dijalankan di sini (placeholder untuk integrasi solver
-        # pihak ketiga: Capsolver / 2Captcha / Hexosolver)
-        octo_token = ""   # diisi oleh solver browser saat gate menyelesaikan FunCaptcha
+    if not octo_token and _cek_cf_solver():
+        arkose_pubkey = _ecak_public_key(html)
+        if arkose_pubkey:
+            px = gh_api._sederhana(proxy) if proxy else gh_api.ke_url(
+                gh_api.proksi_pertama())
+            octo_token, err = _solve_arkose(
+                arkose_pubkey, referer, proxy=px, timeout_s=120)
+            if err:
+                log["catatan_captcha"] = err
+        else:
+            log["catatan_captcha"] = "arkose-public-key-tidak-ditemukan"
+    elif not octo_token:
+        log["catatan_captcha"] = "cf-solver-tidak-tersedia"
 
     # --- 5. POST /signup ---
     try:
