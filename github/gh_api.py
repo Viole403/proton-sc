@@ -31,7 +31,7 @@ from urllib.parse import urlencode, quote
 
 from curl_cffi import requests as creq
 
-IMP = "chrome150"
+IMP = "chrome157"
 
 # ---- [jaringan 2026-10-06] pool geonode + jaminan SESI TIDAK PERNAH direct ----
 # Meter jujur = byte NIC wlp3s0 (hotspot HP) — tiap request WAJIB lewat proxy.
