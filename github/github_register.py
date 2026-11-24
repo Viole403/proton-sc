@@ -30,6 +30,7 @@ import re
 import secrets
 import string
 import time
+import asyncio
 from pathlib import Path
 
 # brutalism: jalur lintas-folder
@@ -48,14 +49,52 @@ from github import gh_api  # noqa: E402,F401
 try:
     from github import playwright_gate  # noqa: E402,F401
     HAS_PG = True
+    HAS_CAMOUFOX = playwright_gate.HAS_CAMOUFOX
 except Exception:
     HAS_PG = False
+    HAS_CAMOUFOX = False
 
 try:
-    from vendor.captcha_solver.arkose.solve import solve_arkose  # noqa: E402,F401
-    HAS_ARKOSE = True
+    from camoufox.async_api import AsyncCamoufox  # noqa: E402,F401
+    HAS_CAMOUFOX = True
 except Exception:
-    HAS_ARKOSE = False
+    HAS_CAMOUFOX = False
+
+try:
+    from curl_cffi import requests as creq
+    HAS_CURL = True
+except Exception:
+    HAS_CURL = False
+
+GITHUB = "https://github.com"
+SIGNUP_URL = f"{GITHUB}/signup"
+REGISTERED_F = konfig.RESULTS / "github_registered.txt"
+
+_UA_CHROME_157 = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36")
+
+_CHROME_HEADERS = {
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
+              "image/avif,image/webp,image/apng,*/*;q=0.8,"
+              "application/signed-exchange;v=b3;q=0.7",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br, zstd",
+    "Cache-Control": "max-age=0",
+    "Sec-Ch-Ua": '"Not_Brand";v="99", "Chromium";v="157", "Google Chrome";v="157"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Linux"',
+    "Sec-Ch-Ua-Arch": '"x86"',
+    "Sec-Ch-Ua-Bitness": '"64"',
+    "Sec-Ch-Ua-Full-Version": '"157.0.8204.0"',
+    "Sec-Ch-Ua-Full-Version-List": '"Not_Brand";v="99.0.0.0", "Chromium";v="157.0.8204.0", "Google Chrome";v="157.0.8204.0"',
+    "Sec-Ch-Prefers-Color-Scheme": "light",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+    "User-Agent": _UA_CHROME_157,
+}
 
 _ARKOSE_PUBKEY_RE = re.compile(
     r'data-publickey="([^"]+)"|public.?key.?[:=]\s*["\']([^"\']+)["\']|'
@@ -222,6 +261,21 @@ def _proxy_untuk_cf_solver(px):
     return px
 
 
+def _parse_camoufox_proxy(proxy_str):
+    """host:port:user:pass -> Camoufox proxy dict atau None."""
+    if not proxy_str:
+        return None
+    parts = proxy_str.split(":")
+    if len(parts) < 2:
+        return None
+    pr = {"server": f"http://{parts[0]}:{parts[1]}"}
+    if len(parts) > 2:
+        pr["username"] = parts[2]
+    if len(parts) > 3:
+        pr["password"] = parts[3]
+    return pr
+
+
 def _simpan_hasil(mail, pw, user, totp_secret, recovery_codes):
     REGISTERED_F.parent.mkdir(parents=True, exist_ok=True)
     baris = f"{mail}|{pw}|{user}|{totp_secret or ''}|{recovery_codes or ''}\n"
@@ -230,17 +284,400 @@ def _simpan_hasil(mail, pw, user, totp_secret, recovery_codes):
     return baris.strip()
 
 
-def daftar_akun_github(proxy=None, headless=True, negara="ID",
+async def _camoufox_signup(proxy=None, headless=False, email=None, pw=None,
+                           user=None, delay_anti_suspend=0):
+    """Pendaftaran GitHub lengkap via Camoufox (Firefox anti-detect).
+
+    Camoufox mampu bypass DataDome tanpa proxy pada IP residential karena
+    fingerprint spoofing di level engine (bukan cuma overlay JS).
+
+    Alur: browser → /signup → form → submit → OTP verifikasi → 2FA → simpan.
+    """
+    import json as _json
+    import re as _re
+
+    log = {"email": email, "user": user, "pw": pw, "sukses": False,
+           "alasan": "", "status": "", "totp_secret": "", "recovery_codes": "",
+           "launch_code": None}
+
+    # --- Kredensial ---
+    if not email:
+        mail, pw_proton = _email_proton_tersedia()
+        if not mail:
+            log["alasan"] = "email-proton-tidak-tersedia"
+            log["status"] = "email-tidak-tersedia"
+            return log
+        email = mail
+        if pw_proton and not pw:
+            pw = pw_proton
+    if not pw:
+        pw = _password_acak()
+    if not user:
+        user = _username_dari_email(email)
+    log.update(email=email, user=user, pw=pw)
+
+    if delay_anti_suspend > 0:
+        await asyncio.sleep(delay_anti_suspend * 60 * random.uniform(0.5, 1.5))
+
+    GITHUB_SIGNUP = "https://github.com/signup"
+    _EMAIL_INPUTS = ["#email", "input[name='email']", "input[type='email']"]
+    _PASSWORD_INPUTS = ["#password", "input[name='password']"]
+    _USERNAME_INPUTS = ["#login", "input[name='login']"]
+    _OTP_INPUTS = [
+        "#otp", "input[name='otp']",
+        "input[autocomplete='one-time-code']", "#launch-code-0",
+    ]
+    _SIGNUP_FORM = "form[action*='signup']"
+
+    cf = None
+    browser = None
+    context = None
+
+    try:
+        cf = AsyncCamoufox(
+            humanize=True,
+            geoip=False,  # Nonaktifkan geoip untuk menghindari error ipecho.net
+            proxy=_parse_camoufox_proxy(proxy) if proxy else None,
+            headless="virtual" if headless else False,
+            os="windows",
+            canvas_noise=False,  # Hindari deteksi privacy.resistFingerprinting
+            disable_coop=True,  # Biarkan klik mencapai widget (Turnstile, slider)
+            window=(1280, 720),
+        )
+        browser = await cf.start()
+        context = await browser.new_context(
+            locale="en-US",
+            # Matikan WebGL untuk mencegah deteksi Camoufox
+            java_script_enabled=True,
+        )
+        # Inject script untuk menyembunyikan WebGL dan sinyal automation lainnya
+        await context.add_init_script("""
+            () => {
+                // Sembunyikan WebGL info
+                const getParameter = WebGLRenderingContext.prototype.getParameter;
+                WebGLRenderingContext.prototype.getParameter = function(parameter) {
+                    if (parameter === 0x8B90 || parameter === 0x8B91 || parameter === 0x8B92 || parameter === 0x8B93 || parameter === 0x8B94 || parameter === 0x8B95 || parameter === 0x8B96 || parameter === 0x8B97 || parameter === 0x8B98 || parameter === 0x8B99 || parameter === 0x8B9A || parameter === 0x8B9B || parameter === 0x8B9C || parameter === 0x8B9D || parameter === 0x8B9E || parameter === 0x8B9F) {
+                        return '';
+                    }
+                    return getParameter.call(this, parameter);
+                };
+                // Sembunyikan sheild aktif
+                delete window.__playwright;
+                delete window.__pw_manual;
+                delete window.__PW_inspect;
+                // Spoof platform
+                Object.defineProperty(navigator, 'platform', {get: () => 'Win32'});
+                Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 4});
+                Object.defineProperty(navigator, 'deviceMemory', {get: () => 8});
+            }
+        """)
+        page = await context.new_page()
+
+        # Buka homepage dulu (warms up session), baru klik "Sign up"
+        # Langsung ke /signup trigger DataDome lebih cepat.
+        # Tunggu lebih lama agar DataDome JS selesai dijalankan
+        # dan cookie session terbentuk.
+        await page.goto("https://github.com/", wait_until="networkidle", timeout=60000)
+        await asyncio.sleep(5)
+
+        # Cek apakah ada halaman tantangan DataDome di homepage
+        try:
+            body_text = (await page.locator("body").inner_text(timeout=3000) or "").lower()
+            if "temporarily restricted" in body_text or "access is restricted" in body_text:
+                log["alasan"] = "datadome-temporarily-restricted-homepage"
+                log["status"] = "datadome-blocked"
+                return log
+            if "captcha" in body_text or "verify you are human" in body_text:
+                # Tunggu tantangan DataDome selesai (biasanya auto-resolve)
+                await asyncio.sleep(15)
+                body_text = (await page.locator("body").inner_text(timeout=3000) or "").lower()
+                if "captcha" in body_text or "verify you are human" in body_text:
+                    log["alasan"] = "datadome-captcha-homepage"
+                    log["status"] = "datadome-captcha"
+                    return log
+        except Exception:
+            pass
+
+        # Cari dan klik tombol "Sign up"
+        signup_clicked = False
+        for sel in ["a:has-text('Sign up')", "button:has-text('Sign up')",
+                    "a[href*='/signup']", "[data-testid*='signup']"]:
+            try:
+                loc = page.locator(sel).first
+                if await loc.count() > 0 and await loc.is_visible():
+                    await loc.scroll_into_view_if_needed()
+                    await asyncio.sleep(1)
+                    await loc.click(timeout=10000)
+                    signup_clicked = True
+                    break
+            except Exception:
+                continue
+
+        if not signup_clicked:
+            # Fallback: langsung ke /signup
+            await page.goto(GITHUB_SIGNUP, wait_until="domcontentloaded", timeout=60000)
+
+        # Tunggu form muncul
+        deadline = asyncio.get_event_loop().time() + 30
+        form_ready = False
+        while asyncio.get_event_loop().time() < deadline:
+            await asyncio.sleep(1)
+            try:
+                for sel in _EMAIL_INPUTS:
+                    loc = page.locator(sel).first
+                    if await loc.count() > 0 and await loc.is_visible():
+                        form_ready = True
+                        break
+            except Exception:
+                pass
+            if form_ready:
+                break
+
+        if not form_ready:
+            # Cek apakah kena DataDome block
+            try:
+                body_text = (await page.locator("body").inner_text(timeout=3000) or "").lower()
+                if "temporarily restricted" in body_text or "access is restricted" in body_text:
+                    log["alasan"] = "datadome-temporarily-restricted"
+                    log["status"] = "datadome-blocked"
+                    return log
+                if "captcha" in body_text:
+                    log["alasan"] = "datadome-captcha"
+                    log["status"] = "datadome-captcha"
+                    return log
+            except Exception:
+                pass
+            log["alasan"] = "form-tidak-muncul"
+            log["status"] = "gate-gagal"
+            return log
+
+        # Isi email
+        for sel in _EMAIL_INPUTS:
+            try:
+                loc = page.locator(sel).first
+                if await loc.count() > 0:
+                    await loc.focus(timeout=5000)
+                    await loc.press_sequentially(email, delay=55)
+                    await loc.evaluate("el => el.blur()")
+                    break
+            except Exception:
+                continue
+        await asyncio.sleep(1.5)
+
+        # Isi password
+        for sel in _PASSWORD_INPUTS:
+            try:
+                loc = page.locator(sel).first
+                if await loc.count() > 0:
+                    await loc.focus(timeout=5000)
+                    await loc.press_sequentially(pw, delay=55)
+                    await loc.evaluate("el => el.blur()")
+                    break
+            except Exception:
+                continue
+        await asyncio.sleep(1.5)
+
+        # Isi username
+        username_filled = False
+        for sel in _USERNAME_INPUTS:
+            try:
+                loc = page.locator(sel).first
+                if await loc.count() > 0:
+                    await loc.focus(timeout=5000)
+                    await loc.press_sequentially(user, delay=55)
+                    await loc.evaluate("el => el.blur()")
+                    username_filled = True
+                    break
+            except Exception:
+                continue
+
+        if not username_filled:
+            log["alasan"] = "username-input-tidak-ditemukan"
+            log["status"] = "gate-gagal"
+            return log
+
+        await asyncio.sleep(3)
+
+        # Tunggu tombol Create account enabled, lalu klik via DOM
+        deadline = asyncio.get_event_loop().time() + 30
+        clicked = False
+        while asyncio.get_event_loop().time() < deadline:
+            enabled = await page.evaluate("""
+                () => {
+                    const form = document.querySelector("form[action*='signup']");
+                    const b = form && form.querySelector("button[type='submit']");
+                    return b && !b.disabled;
+                }
+            """)
+            if enabled:
+                clicked = await page.evaluate("""
+                    () => {
+                        const form = document.querySelector("form[action*='signup']");
+                        const b = form && form.querySelector("button[type='submit']");
+                        if (!b || b.disabled) return false;
+                        b.click();
+                        return true;
+                    }
+                """)
+                if clicked:
+                    break
+            await asyncio.sleep(0.8)
+
+        if not clicked:
+            log["alasan"] = "create-account-tombol-disabled"
+            log["status"] = "gate-gagal"
+            return log
+
+        # Tunggu post-submit state
+        deadline = asyncio.get_event_loop().time() + 120
+        verified = False
+        while asyncio.get_event_loop().time() < deadline:
+            await asyncio.sleep(2)
+            # Cek OTP input
+            try:
+                for sel in _OTP_INPUTS:
+                    loc = page.locator(sel).first
+                    if await loc.count() > 0 and await loc.is_visible():
+                        verified = True
+                        break
+            except Exception:
+                pass
+            if verified:
+                break
+            # Cek cookies logged_in
+            try:
+                cookies = await context.cookies()
+                for c in cookies:
+                    if c.get("name") == "logged_in" and str(c.get("value", "")).lower() == "yes":
+                        verified = True
+                        break
+            except Exception:
+                pass
+            if verified:
+                break
+
+        if not verified:
+            log["alasan"] = "verifikasi-tidak-terdeteksi"
+            log["status"] = "gate-gagal"
+            return log
+
+        # --- Ambil kode launch dari Proton inbox ---
+        t0 = time.time()
+        kode, err = _ambil_kode_launch(email, pw, t0, budget=180)
+        log["launch_code"] = kode
+        if err:
+            log["alasan"] = f"otp:{err}"
+            log["status"] = "otp-gagal"
+            return log
+
+        if not kode:
+            log["alasan"] = "kode-launch-tidak-diterima"
+            log["status"] = "otp-gagal"
+            return log
+
+        # Isi kode OTP
+        try:
+            boxes = page.locator("input[id^='launch-code-']")
+            count = await boxes.count()
+            if count >= len(kode):
+                for i, digit in enumerate(kode):
+                    try:
+                        await boxes.nth(i).fill(digit, timeout=3000)
+                    except Exception:
+                        pass
+                    await _asyncio.sleep(0.1)
+                try:
+                    await page.click("button[class*='Button--primary']", timeout=5000)
+                except Exception:
+                    await page.click("button[type='submit']", timeout=5000)
+            else:
+                for sel in _OTP_INPUTS:
+                    try:
+                        loc = page.locator(sel).first
+                        if await loc.count() > 0:
+                            await loc.fill(kode, timeout=5000)
+                            break
+                    except Exception:
+                        continue
+                try:
+                    await page.click("button[type='submit']", timeout=5000)
+                except Exception:
+                    pass
+        except Exception as e:
+            log["alasan"] = f"otp-input-gagal:{str(e)[:60]}"
+            log["status"] = "otp-gagal"
+            return log
+
+        await _asyncio.sleep(5)
+
+        # Konfirmasi sukses
+        try:
+            cookies = await context.cookies()
+            for c in cookies:
+                if c.get("name") == "logged_in" and str(c.get("value", "")).lower() == "yes":
+                    log["sukses"] = True
+                    log["status"] = "terverifikasi"
+                    break
+        except Exception:
+            pass
+
+        if not log["sukses"]:
+            log["alasan"] = "login-cookie-tidak-ditemukan"
+            log["status"] = "verifikasi-gagal"
+            return log
+
+        # Simpan hasil
+        _simpan_hasil(email, pw, user, "", "")
+        return log
+
+    except Exception as e:
+        log["alasan"] = f"{type(e).__name__}: {str(e)[:80]}"
+        log["status"] = "exception"
+        return log
+
+    finally:
+        try:
+            if context:
+                await context.close()
+        except Exception:
+            pass
+        try:
+            if browser:
+                await browser.close()
+        except Exception:
+            pass
+        try:
+            if cf:
+                await cf.stop()
+        except Exception:
+            pass
+
+
+def daftar_akun_github(proxy=None, headless=False, negara="ID",
                        email=None, pw=None, user=None,
-                       delay_anti_suspend=0):
+                       delay_anti_suspend=0, user_data_dir=None,
+                       use_camoufox=None):
     """Daftar satu akun GitHub lengkap (termasuk verifikasi email).
 
     Return dict: {email, user, pw, sukses, alasan, totp_secret, recovery_codes,
                   launch_code, status}
+
+    use_camoufox: None (auto) → pakai Camoufox bila tidak ada proxy
+                  (DataDome bypass tanpa proxy pada raw IP residential),
+                  True → paksa Camoufox, False → paksa Chromium
     """
+    # Inisialisasi log terlebih dahulu
     log = {"email": email, "user": user, "sukses": False,
            "alasan": "", "status": "", "totp_secret": "", "recovery_codes": "",
            "launch_code": None}
+
+    # Auto-aktifkan Camoufox bila tidak ada proxy dan belum diatur
+    if use_camoufox is None:
+        use_camoufox = (not proxy) and HAS_CAMOUFOX
+    elif use_camoufox and not HAS_CAMOUFOX:
+        log["alasan"] = "camoufox-tidak-terpasang"
+        log["status"] = "solver-tidak-tersedia"
+        return log
 
     # --- 1. Persiapan kredensial ---
     if not email:
@@ -266,32 +703,69 @@ def daftar_akun_github(proxy=None, headless=True, negara="ID",
     sesi = None
     r = None
     tok = None
-    if HAS_PG:
+    if HAS_PG and not use_camoufox:
         try:
-            b = playwright_gate.pinjam_browser(proxy=proxy, headless=headless)
+            b = playwright_gate.pinjam_browser(
+                proxy=proxy, headless=headless,
+                user_data_dir=user_data_dir)
             ctx = b.new_context()
             page = ctx.new_page()
             page.goto(SIGNUP_URL, wait_until="domcontentloaded", timeout=30000)
-            # tunggu form muncul / DataDome selesai
-            page.wait_for_selector("form", timeout=20000)
+            # tunggu form muncul / DataDome selesai — beri waktu lebih lama
+            # agar stealth + cookie session bisa menyegarkan
+            page.wait_for_timeout(5000)
+            try:
+                page.wait_for_selector("form", timeout=30000)
+            except Exception:
+                # form mungkin muncul setelah DataDome challenge selesai
+                page.wait_for_timeout(10000)
             html = page.content()
             # panen cookie + token
             cookies = ctx.cookies()
             tok = gh_api.form_tokens(html)
-            # simpan cookie ke sesi HTTP
-            sesi = gh_api.GhSesi(proxy=proxy, izinkan_direct=True)
-            for ck in cookies:
-                try:
-                    sesi.s.cookies.set(ck["name"], ck["value"],
-                                       domain=ck.get("domain") or "github.com",
-                                       path=ck.get("path") or "/")
-                except Exception:
-                    pass
+            # simpan cookie ke sesi HTTP — pakai curl_cffi impersonate chrome157
+            # agar TLS/JA3 fingerprint cocok dengan browser asli (anti DataDome
+            # layer network: JA3/JA4 fingerprint + header konsisten)
+            if HAS_CURL:
+                sesi = creq.Session(impersonate="chrome157", timeout=30)
+                sesi.headers.update(_CHROME_HEADERS)
+                for ck in cookies:
+                    try:
+                        sesi.cookies.set(ck["name"], ck["value"],
+                                         domain=ck.get("domain") or "github.com",
+                                         path=ck.get("path") or "/")
+                    except Exception:
+                        pass
+            else:
+                sesi = gh_api.GhSesi(proxy=proxy, izinkan_direct=True)
+                for ck in cookies:
+                    try:
+                        sesi.s.cookies.set(ck["name"], ck["value"],
+                                           domain=ck.get("domain") or "github.com",
+                                           path=ck.get("path") or "/")
+                    except Exception:
+                        pass
             r = type("R", (), {"text": html, "status_code": 200})()
             ctx.close()
             b.close()
         except Exception as e:
             log["alasan"] = f"gate-gagal:{type(e).__name__}:{str(e)[:80]}"
+            log["status"] = "gate-gagal"
+            return log
+    elif use_camoufox:
+        # Camoufox path — async, dijalankan pada event loop yang tersedia
+        try:
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+            result = loop.run_until_complete(_camoufox_signup(
+                proxy=proxy, headless=headless, email=email, pw=pw, user=user,
+                delay_anti_suspend=delay_anti_suspend))
+            return result
+        except Exception as e:
+            log["alasan"] = f"camoufox-gagal:{type(e).__name__}:{str(e)[:80]}"
             log["status"] = "gate-gagal"
             return log
     else:
@@ -409,7 +883,7 @@ def daftar_akun_github(proxy=None, headless=True, negara="ID",
 
 
 def daftar_batch(jumlah=1, proxy_pool=None, delay_menit=5,
-                 headless=True, negara="ID"):
+                 headless=False, negara="ID"):
     """Daftar batch akun GitHub dengan jeda anti-suspend."""
     hasil = []
     for i in range(jumlah):
@@ -418,8 +892,13 @@ def daftar_batch(jumlah=1, proxy_pool=None, delay_menit=5,
             px = proxy_pool[i % len(proxy_pool)]
         elif proxy_pool is None:
             px = gh_api.ke_url(gh_api.proksi_pertama())
+        # Setiap akun pakai profil tersendiri agar cookie/session tidak tumpang
+        # tindih (DataDome melacak via cookie + session history)
+        import tempfile
+        udd = tempfile.mkdtemp(prefix="github-reg-")
         r = daftar_akun_github(proxy=px, headless=headless, negara=negara,
-                               delay_anti_suspend=delay_menit)
+                               delay_anti_suspend=delay_menit,
+                               user_data_dir=udd)
         hasil.append(r)
         if not r["sukses"] and i < jumlah - 1:
             print(f"[github-register] akun {i+1}/{jumlah} gagal: {r['alasan']}")
